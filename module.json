@@ -1,0 +1,18 @@
+{
+  "id": "ship-wheel",
+  "title": "Ship Wheel",
+  "description": "Module for fun",
+  "version": "0.1.0",
+  "authors": [
+    {
+      "name": "SnowKorshun"
+    }
+  ],
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "esmodules": [
+    "scripts/main.js"
+  ]
+}
