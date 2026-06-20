@@ -64,6 +64,12 @@ let inertiaDeceleration = 0.06;
 // Порог скорости, ниже которого инерция считается завершённой.
 let inertiaStopSpeed = 0.2;
 
+// Как часто отправлять поворот токена другим игрокам (мс).
+// Меньше значение = плавнее для других игроков,
+// но больше нагрузка на сеть.
+let lastNetworkTokenUpdate = 0;
+let networkTokenUpdateDelay = 50;
+
 
 // --------------------------------------------------
 // Кнопка модуля на панели инструментов Foundry
@@ -326,6 +332,18 @@ document.addEventListener("mousemove", (event) => {
 			// Документ токена сохраним позже, когда мышь отпустят.
 			controlledTokenRotation += deltaDegrees;
 			token.mesh.rotation = controlledTokenRotation * Math.PI / 180;
+			if (now - lastNetworkTokenUpdate >= networkTokenUpdateDelay) {
+				lastNetworkTokenUpdate = now;
+
+				token.document.update(
+					{
+						rotation: controlledTokenRotation
+					},
+					{
+						animate: false
+					}
+				);
+			}
 		}
 
 		wheelRotation += deltaDegrees;
@@ -465,11 +483,26 @@ function startInertia() {
 		wheelBodyElement.style.transform =
 			`rotate(${wheelRotation}deg)`;
 			if (inertiaToken && inertiaTokenRotation !== null) {
-					inertiaTokenRotation += wheelVelocity;
+				inertiaTokenRotation += wheelVelocity;
 
-					inertiaToken.mesh.rotation =
-						inertiaTokenRotation * Math.PI / 180;
+				inertiaToken.mesh.rotation =
+					inertiaTokenRotation * Math.PI / 180;
+
+				const now = Date.now();
+
+				if (now - lastNetworkTokenUpdate >= networkTokenUpdateDelay) {
+					lastNetworkTokenUpdate = now;
+
+					inertiaToken.document.update(
+						{
+							rotation: inertiaTokenRotation
+						},
+						{
+							animate: false
+						}
+					);
 				}
+			}
 
 		inertiaFrame = requestAnimationFrame(animateInertia);
 	}
