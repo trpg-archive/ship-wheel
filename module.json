@@ -2,7 +2,7 @@
   "id": "ship-wheel",
   "title": "Ship Wheel",
   "description": "Interactive ship wheel for rotating tokens.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "authors": [
     {
       "name": "SnowKorshun",

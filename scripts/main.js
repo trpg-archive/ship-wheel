@@ -63,8 +63,6 @@ let wheelVelocity = 0;
 // activePointerId не позволяет второму пальцу/указателю вмешаться в действие.
 let interactionMode = null;
 let activePointerId = null;
-// Пока Foundry подтверждает блокировку, действие ещё не считается начатым.
-let pendingRotationPointerId = null;
 
 // Токен фиксируется в момент захвата. Даже если выделение изменится во время
 // вращения, штурвал продолжит управлять именно этим токеном.
@@ -108,6 +106,9 @@ const pendingTokenUpdates = [];
 // удалённый клиент не соединяет конец прошлого вращения с началом нового.
 let rotationSessionId = null;
 let rotationSessionCounter = 0;
+let pilotLockConfirmed = false;
+let pilotLockRequestSessionId = null;
+let pendingLockCompletion = null;
 
 // Для каждого удалённо вращаемого токена храним текущий и целевой угол.
 const remoteRotations = new Map();
@@ -121,7 +122,7 @@ Hooks.on("updateToken", (document, change, options, userId) => {
     // Сервер применит их последовательно; клиент, увидевший чужую подтверждённую
     // блокировку, прекращает своё локальное вращение.
     const changedFlags = change.flags?.[MODULE_ID];
-    const locallyControlledToken = activeToken ?? inertiaToken;
+    const locallyControlledToken = activeToken ?? inertiaToken ?? pendingLockCompletion?.token;
     if (
         userId !== game.user.id &&
         locallyControlledToken?.id === document.id &&
@@ -163,21 +164,18 @@ Hooks.on("updateToken", (document, change, options, userId) => {
 });
 
 Hooks.on("getSceneControlButtons", (controls) => {
-    // Добавляем собственную группу инструментов на левую панель Foundry.
-    controls[MODULE_ID] = {
+    // Мгновенную кнопку добавляем в стандартную группу токенов. Отдельная
+    // группа без активного инструмента может запутать состояние Scene Controls
+    // и потребовать лишнего клика при переходе к измерениям или шаблонам.
+    const tokenControls = controls.tokens;
+    if (!tokenControls?.tools) return;
+
+    tokenControls.tools[MODULE_ID] = {
         name: MODULE_ID,
-        title: "Штурвал",
-        icon: "fas fa-sailboat",
-        layer: "tokens",
-        tools: {
-            wheel: {
-                name: "wheel",
-                title: "Открыть штурвал",
-                icon: "fas fa-dharmachakra",
-                button: true,
-                onClick: toggleWheel
-            }
-        }
+        title: "Открыть штурвал",
+        icon: "fas fa-dharmachakra",
+        button: true,
+        onClick: toggleWheel
     };
 });
 
@@ -264,7 +262,6 @@ function toggleWheel() {
 function closeWheel() {
     // Перед удалением интерфейса сохраняем угол возможной инерции и корректно
     // заканчиваем активное действие пользователя.
-    pendingRotationPointerId = null;
     cancelInertia(true);
     finishInteraction(false);
     wheelElement?.remove();
@@ -276,8 +273,12 @@ function closeWheel() {
     wheelVelocity = 0;
 }
 
-async function beginRotation(event) {
+function beginRotation(event) {
     event.preventDefault();
+
+    // Пока обрабатывается очень быстрый завершённый жест, не начинаем вторую
+    // сессию поверх первой.
+    if (pendingLockCompletion) return;
 
     // Если штурвал ещё крутился по инерции, фиксируем её результат до начала
     // новой независимой сессии вращения.
@@ -286,47 +287,21 @@ async function beginRotation(event) {
     const token = canvas.tokens.controlled[0] ?? null;
     const sessionId = `${game.user.id}:${Date.now()}:${++rotationSessionCounter}`;
 
-    // Для выбранного токена сначала пытаемся получить временную блокировку.
-    // Если блокировка другого игрока ещё действует, вращение не начинается.
+    // Если уже видим действующую чужую блокировку, запрос к серверу не нужен.
     if (token) {
         const existingLock = token.document.getFlag(MODULE_ID, "pilotLock");
         if (isPilotLockActive(existingLock) && existingLock.userId !== game.user.id) {
             ui.notifications.warn("У штурвала сейчас другой пилот");
             return;
         }
-
-        pendingRotationPointerId = event.pointerId;
-
-        try {
-            await token.document.update({
-                [`flags.${MODULE_ID}.pilotLock`]: createPilotLock(sessionId)
-            });
-        } catch (error) {
-            pendingRotationPointerId = null;
-            console.error(`${MODULE_ID} | Не удалось получить управление токеном`, error);
-            ui.notifications.warn("Не удалось получить управление штурвалом");
-            return;
-        }
-
-        // Пользователь мог отпустить указатель, пока сервер отвечал.
-        if (pendingRotationPointerId !== event.pointerId) {
-            await releasePilotLock(token, sessionId);
-            return;
-        }
-
-        // После ответа перечитываем флаг. Это закрывает гонку, когда два игрока
-        // нажали почти одновременно и отправили запросы до получения ответа.
-        const confirmedLock = token.document.getFlag(MODULE_ID, "pilotLock");
-        if (confirmedLock?.sessionId !== sessionId || confirmedLock.userId !== game.user.id) {
-            pendingRotationPointerId = null;
-            ui.notifications.warn("У штурвала сейчас другой пилот");
-            return;
-        }
     }
 
-    pendingRotationPointerId = null;
     rotationSessionId = sessionId;
+    pilotLockConfirmed = !token;
+    pilotLockRequestSessionId = token ? sessionId : null;
 
+    // Локальное действие начинается сразу. На медленном внешнем хостинге не
+    // нужно держать указатель неподвижно, ожидая сетевой ответ.
     interactionMode = "rotate";
     activePointerId = event.pointerId;
     activeToken = token;
@@ -352,6 +327,75 @@ async function beginRotation(event) {
     wheelBodyElement.style.cursor = "grabbing";
     // Захват указателя продолжает присылать события даже за границами элемента.
     wheelElement.setPointerCapture?.(event.pointerId);
+
+    if (token) acquirePilotLockForRotation(token, sessionId);
+}
+
+async function acquirePilotLockForRotation(token, sessionId) {
+    try {
+        await token.document.update({
+            [`flags.${MODULE_ID}.pilotLock`]: createPilotLock(sessionId)
+        });
+    } catch (error) {
+        console.error(`${MODULE_ID} | Не удалось получить управление токеном`, error);
+        handlePilotLockFailure(token, sessionId, false);
+        return;
+    }
+
+    const confirmedLock = token.document.getFlag(MODULE_ID, "pilotLock");
+    if (confirmedLock?.sessionId !== sessionId || confirmedLock.userId !== game.user.id) {
+        handlePilotLockFailure(token, sessionId, true);
+        return;
+    }
+
+    pilotLockConfirmed = true;
+    if (pilotLockRequestSessionId === sessionId) pilotLockRequestSessionId = null;
+
+    // Короткий жест мог закончиться до ответа сервера. В этом случае завершаем
+    // его сейчас: либо запускаем инерцию, либо сохраняем итоговый угол.
+    if (pendingLockCompletion?.sessionId === sessionId) {
+        const completion = pendingLockCompletion;
+        pendingLockCompletion = null;
+        inertiaToken = completion.token;
+        inertiaTokenRotation = completion.rotation;
+        wheelVelocity = completion.velocity;
+        rotationSessionId = sessionId;
+
+        if (completion.allowInertia && Math.abs(wheelVelocity) >= INERTIA_START_SPEED) {
+            startInertia();
+        } else {
+            wheelVelocity = 0;
+            persistFinalRotation(completion.token, completion.rotation, sessionId);
+            rotationSessionId = null;
+        }
+        return;
+    }
+
+    // Передаём актуальный угол, накопленный за время ожидания блокировки.
+    if (activeToken === token && rotationSessionId === sessionId && activeTokenRotation !== null) {
+        broadcastRotation(token, activeTokenRotation, false, sessionId);
+    }
+}
+
+function handlePilotLockFailure(token, sessionId, occupiedByOtherPilot) {
+    if (pilotLockRequestSessionId === sessionId) pilotLockRequestSessionId = null;
+
+    if (activeToken === token && rotationSessionId === sessionId) {
+        setTokenVisualRotation(token, token.document.rotation);
+        abortLocalRotationForPilotLock();
+    }
+
+    if (pendingLockCompletion?.token === token && pendingLockCompletion.sessionId === sessionId) {
+        pendingLockCompletion = null;
+        rotationSessionId = null;
+        setTokenVisualRotation(token, token.document.rotation);
+    }
+
+    ui.notifications.warn(
+        occupiedByOtherPilot
+            ? "У штурвала сейчас другой пилот"
+            : "Не удалось получить управление штурвалом"
+    );
 }
 
 function beginDragging(event) {
@@ -390,23 +434,14 @@ document.addEventListener("pointermove", (event) => {
 });
 
 document.addEventListener("pointerup", (event) => {
-    // Не начинаем вращение задним числом, если указатель отпущен во время
-    // ожидания ответа сервера на запрос блокировки.
-    if (event.pointerId === pendingRotationPointerId) {
-        pendingRotationPointerId = null;
-    }
     if (event.pointerId === activePointerId) finishInteraction(true);
 });
 
 document.addEventListener("pointercancel", (event) => {
-    if (event.pointerId === pendingRotationPointerId) {
-        pendingRotationPointerId = null;
-    }
     if (event.pointerId === activePointerId) finishInteraction(true);
 });
 
 window.addEventListener("blur", () => {
-    pendingRotationPointerId = null;
     finishInteraction(true);
 });
 
@@ -455,7 +490,11 @@ function rotateWheel(event) {
         // В сеть угол отправляется реже функцией broadcastRotation.
         activeTokenRotation += deltaDegrees;
         setTokenVisualRotation(activeToken, activeTokenRotation);
-        broadcastRotation(activeToken, activeTokenRotation, false, rotationSessionId);
+        // Пока сервер не подтвердил блокировку, меняем только локальную картинку.
+        // После подтверждения acquirePilotLockForRotation отправит свежий угол.
+        if (pilotLockConfirmed) {
+            broadcastRotation(activeToken, activeTokenRotation, false, rotationSessionId);
+        }
     }
 }
 
@@ -496,6 +535,20 @@ function finishInteraction(allowInertia) {
 
     // Перемещение и изменение размера не должны запускать старую инерцию.
     if (completedMode !== "rotate") {
+        wheelVelocity = 0;
+        return;
+    }
+
+    // На внешнем хостинге короткий жест может закончиться раньше ответа о
+    // блокировке. Запоминаем результат и завершим его сразу после подтверждения.
+    if (token && !pilotLockConfirmed) {
+        pendingLockCompletion = {
+            token,
+            rotation,
+            velocity: wheelVelocity,
+            allowInertia,
+            sessionId: rotationSessionId
+        };
         wheelVelocity = 0;
         return;
     }
@@ -751,8 +804,8 @@ async function releasePilotLock(token, sessionId) {
 }
 
 function abortLocalRotationForPilotLock() {
-    const lostToken = activeToken ?? inertiaToken;
-    const lostSessionId = rotationSessionId;
+    const lostToken = activeToken ?? inertiaToken ?? pendingLockCompletion?.token;
+    const lostSessionId = rotationSessionId ?? pendingLockCompletion?.sessionId;
 
     if (inertiaFrame !== null) cancelAnimationFrame(inertiaFrame);
 
@@ -769,6 +822,9 @@ function abortLocalRotationForPilotLock() {
     lastAngle = null;
     lastMoveTime = null;
     rotationSessionId = null;
+    pilotLockConfirmed = false;
+    pilotLockRequestSessionId = null;
+    pendingLockCompletion = null;
 
     // Не отправляем оставшиеся в очереди углы сессии, которая потеряла право
     // управления. Уже выполняющийся запрос отменить нельзя, но очередь очищается.
